@@ -10,7 +10,6 @@ from awscrt.auth import AwsCredentialsProvider
 from s3transfer.futures import CRTTransferFuture, TransferMeta
 from s3transfer import OSUtils
 from s3transfer.utils import CallArgs
-from s3transfer.constants import GIGA
 import logging
 
 import os
@@ -54,6 +53,11 @@ class CRTTransferManager(object):
     def delete(self, bucket, key, extra_args=None, subscribers=[]):
         callargs = CallArgs(bucket=bucket, key=key,
                             extra_args=extra_args, subscribers=subscribers, request_type="delete_object")
+        return self._submit_transfer(callargs)
+
+    def copy(self, copy_source, bucket, key, extra_args=None, subscribers=[], source_client=None):
+        callargs = CallArgs(bucket=bucket, copy_source=copy_source, key=key, extra_args=extra_args,
+                            subscribers=subscribers, source_client=source_client, request_type="copy_object")
         return self._submit_transfer(callargs)
 
     def _submit_transfer(self, call_args):
