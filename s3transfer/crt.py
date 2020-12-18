@@ -55,11 +55,6 @@ class CRTTransferManager(object):
                             extra_args=extra_args, subscribers=subscribers, request_type="delete_object")
         return self._submit_transfer(callargs)
 
-    def copy(self, copy_source, bucket, key, extra_args=None, subscribers=[], source_client=None):
-        callargs = CallArgs(bucket=bucket, copy_source=copy_source, key=key, extra_args=extra_args,
-                            subscribers=subscribers, source_client=source_client, request_type="copy_object")
-        return self._submit_transfer(callargs)
-
     def _submit_transfer(self, call_args):
         future = self._submitter.submit(call_args)
         self.futures.append(future)
