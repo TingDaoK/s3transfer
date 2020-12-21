@@ -150,7 +150,7 @@ class CRTExecutor(object):
         host_resolver = DefaultHostResolver(event_loop_group)
         bootstrap = ClientBootstrap(event_loop_group, host_resolver)
         # self._credential_provider = CrtCredentialProviderWrapper(session)
-        credential_provider = AwsCredentialsProvider.new_py_provider(
+        credential_provider = AwsCredentialsProvider.new_python(
             CrtCredentialProviderWrapper(session))
 
         # if max_bandwidth not set, we will target 100 Gbps, which means as much as possible.
