@@ -149,7 +149,6 @@ class CRTExecutor(object):
         event_loop_group = EventLoopGroup(configs.max_request_concurrency)
         host_resolver = DefaultHostResolver(event_loop_group)
         bootstrap = ClientBootstrap(event_loop_group, host_resolver)
-        # self._credential_provider = CrtCredentialProviderWrapper(session)
         credential_provider = AwsCredentialsProvider.new_python(
             CrtCredentialProviderWrapper(session))
 
@@ -194,7 +193,7 @@ class CRTExecutor(object):
             crt_request.headers.set(
                 "Content-Type", content_type)
             crt_request.body_stream = future.crt_body_stream
-        # TODO CRT logs, may need to expose an option for user to enable/disable it from CLI?
+        # TODO CRT logs, may need to expose an option for user to enable/disable CRT log from CLI?
         log_name = "error_log.txt"
         if os.path.exists(log_name):
             os.remove(log_name)

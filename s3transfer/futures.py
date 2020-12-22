@@ -199,6 +199,7 @@ class CRTTransferFuture(BaseTransferFuture):
             f.write(chunk)
 
     def on_done(self, **kwargs):
+        print("CRT s3 request finished.")
         self.subscriber_manager.on_done()
 
     def set_s3_request(self, s3_request):
