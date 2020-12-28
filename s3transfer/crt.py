@@ -4,7 +4,7 @@ from botocore.utils import CrtUtil
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.compat import urlsplit, six
-from awscrt.s3 import S3Client, S3RequestType
+from awscrt.s3 import S3Client, S3RequestType, S3RequestTlsMode
 from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup, init_logging, LogLevel
 from awscrt.auth import AwsCredentialsProvider
 from s3transfer.futures import CRTTransferFuture, TransferMeta
@@ -160,6 +160,7 @@ class CRTExecutor(object):
 
         self._crt_client = S3Client(
             bootstrap=bootstrap,
+            tls_mode=S3RequestTlsMode.AWS_MR_TLS_DISABLED,
             region=region,
             credential_provider=credential_provider,
             part_size=configs.multipart_chunksize,
@@ -167,6 +168,7 @@ class CRTExecutor(object):
 
     def submit(self, serialized_http_requests, call_args):
         logger.debug(serialized_http_requests)
+        # print(serialized_http_requests)
         crt_request = CrtUtil.crt_request_from_aws_request(
             serialized_http_requests)
         if crt_request.headers.get("host") is None:
