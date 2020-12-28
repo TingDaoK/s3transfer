@@ -152,8 +152,8 @@ class CRTExecutor(object):
         credential_provider = AwsCredentialsProvider.new_python(
             CrtCredentialProviderWrapper(session))
 
-        # if max_bandwidth not set, we will target 100 Gbps, which means as much as possible.
-        target_gbps = 100
+        # # if max_bandwidth not set, we will target 100 Gbps, which means as much as possible.
+        target_gbps = 0
         if configs.max_bandwidth:
             # Translate bytes to gigabits
             target_gbps = configs.max_bandwidth*8/(1000*1000)
