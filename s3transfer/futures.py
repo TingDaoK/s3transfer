@@ -80,6 +80,7 @@ class CrtLazyReadStream(object):
         the stream when everthing has been read form the file
     2. Report the progress to subscriber
     """
+
     def __init__(self, filename, pattern, subscriber_manager, length=0):
         self._filename = filename
         self.length = length
@@ -199,7 +200,6 @@ class CRTTransferFuture(BaseTransferFuture):
             f.write(chunk)
 
     def on_done(self, **kwargs):
-        print("CRT s3 request finished.")
         self.subscriber_manager.on_done()
 
     def set_s3_request(self, s3_request):
