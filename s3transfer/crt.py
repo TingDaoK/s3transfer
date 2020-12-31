@@ -1,20 +1,100 @@
+import logging
+import os
+from io import BytesIO
+
 import botocore.awsrequest
 import botocore.session
-from botocore.utils import CrtUtil
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.compat import urlsplit, six
+import awscrt.http
 from awscrt.s3 import S3Client, S3RequestType
-from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup, init_logging, LogLevel
+from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup,
 from awscrt.auth import AwsCredentialsProvider
-from s3transfer.futures import CRTTransferFuture, TransferMeta
-from s3transfer import OSUtils
-from s3transfer.utils import CallArgs
-import logging
 
-import os
+from s3transfer.futures import CRTTransferFuture, TransferMeta
+from s3transfer.utils import CallArgs
 
 logger = logging.getLogger(__name__)
+
+
+class CrtUtil(object):
+    '''
+    Utilities related to CRT.
+    '''
+    def crt_request_from_aws_request(aws_request):
+        url_parts = urlsplit(aws_request.url)
+        if isinstance(aws_request, botocore.awsrequest.AWSPreparedRequest):
+            crt_path = url_parts.path
+            if url_parts.query:
+                crt_path = '%s?%s' % (crt_path, url_parts.query)
+            headers_list = []
+            for name, value in aws_request.headers.items():
+                if isinstance(value, str):
+                    headers_list.append((name, value))
+                else:
+                    headers_list.append((name, str(value, 'utf-8')))
+
+            crt_headers = awscrt.http.HttpHeaders(headers_list)
+        else:
+            crt_path = url_parts.path if url_parts.path else '/'
+            if aws_request.params:
+                array = []
+                for (param, value) in aws_request.params.items():
+                    value = str(value)
+                    array.append('%s=%s' % (param, value))
+                crt_path = crt_path + '?' + '&'.join(array)
+            elif url_parts.query:
+                crt_path = '%s?%s' % (crt_path, url_parts.query)
+            crt_headers = awscrt.http.HttpHeaders(aws_request.headers.items())
+        # CRT requires body (if it exists) to be an I/O stream.
+        crt_body_stream = None
+        if aws_request.body:
+            if hasattr(aws_request.body, 'seek'):
+                crt_body_stream = aws_request.body
+            else:
+                crt_body_stream = BytesIO(aws_request.body)
+
+        crt_request = awscrt.http.HttpRequest(
+            method=aws_request.method,
+            path=crt_path,
+            headers=crt_headers,
+            body_stream=crt_body_stream)
+        return crt_request
+
+
+class CrtSubscribersManager(object):
+    """
+    A simple wrapper to handle the subscriber for CRT
+    """
+
+    def __init__(self, subscribers=None, future=None):
+        self._subscribers = subscribers
+        self._future = future
+        self._on_queued_callbacks = self._get_callbacks("queued")
+        self._on_progress_callbacks = self._get_callbacks("progress")
+        self._on_done_callbacks = self._get_callbacks("done")
+
+    def _get_callbacks(self, callback_type):
+        callbacks = []
+        for subscriber in self._subscribers:
+            callback_name = 'on_' + callback_type
+            if hasattr(subscriber, callback_name):
+                callbacks.append(getattr(subscriber, callback_name))
+        return callbacks
+
+    def on_queued(self):
+        # On_queued seems not being useful for CRT.
+        for callback in self._on_queued_callbacks:
+            callback(self._future)
+
+    def on_progress(self, bytes_transferred):
+        for callback in self._on_progress_callbacks:
+            callback(self._future, bytes_transferred)
+
+    def on_done(self):
+        for callback in self._on_done_callbacks:
+            callback(self._future)
 
 
 class CRTTransferManager(object):
@@ -85,7 +165,6 @@ class CRTSubmitter(object):
         self._client.meta.events.register(
             'before-send.s3.*', self._make_fake_http_response)
         self._executor = CRTExecutor(config, session, region)
-        self._osutil = OSUtils()
 
     def _capture_http_request(self, request, **kwargs):
         request.context['http_request'] = request
@@ -191,12 +270,7 @@ class CRTExecutor(object):
                 content_type = call_args.extra_args['ContentType']
             crt_request.headers.set(
                 "Content-Type", content_type)
-        # TODO CRT logs, may need to expose an option for user to enable/disable CRT log from CLI?
-        log_name = "error_log.txt"
-        if os.path.exists(log_name):
-            os.remove(log_name)
 
-        init_logging(LogLevel.Error, log_name)
         s3_request = self._crt_client.make_request(request=crt_request,
                                                    type=type,
                                                    file=call_args.fileobj,
