@@ -70,58 +70,6 @@ class BaseTransferMeta(object):
         raise NotImplementedError('user_context')
 
 
-class CrtLazyReadStream(object):
-    """
-    A wrapper around Python file stream.
-
-    For:
-    1. Only open the file when the request needs to read form it.
-        To avoid too many files opened at the same time. Close
-        the stream when everthing has been read form the file
-    2. Report the progress to subscriber
-    """
-
-    def __init__(self, filename, pattern, subscriber_manager, length=0):
-        self._filename = filename
-        self.length = length
-        self._stream = None
-        self._pattern = pattern
-        self._subscriber_manager = subscriber_manager
-
-    def _available_stream(self):
-        if self._stream is None:
-            self._stream = open(self._filename, self._pattern)
-            return
-        # TODO it may keep the file open all the time, need to dig into the detail later
-        if self._stream.closed:
-            self._stream = open(self._filename, self._pattern)
-
-    def read(self, length):
-        self._available_stream()
-        data = self._stream.read(length)
-        read_len = len(data)
-        self._subscriber_manager.on_progress(read_len)
-        if read_len is 0:
-            self._stream.close()
-        return data
-
-    def readinto1(self, m):
-        # Read into memoryview m, which has better performance than read
-        self._available_stream()
-        len = self._stream.readinto1(m)
-        self._subscriber_manager.on_progress(len)
-        if len is 0:
-            self._stream.close()
-        return len
-
-    def seek(self, offset, whence):
-        self._available_stream()
-        return self._stream.seek(offset, whence)
-
-    def close(self):
-        pass
-
-
 class CrtSubscribersManager(object):
     """
     A simple wrapper to handle the subscriber for CRT
@@ -177,30 +125,15 @@ class CRTTransferFuture(BaseTransferFuture):
         self.subscriber_manager = CrtSubscribersManager(
             meta.call_args.subscribers, self)
 
-        self.crt_body_stream = None
-        if meta.call_args.request_type == 'put_object':
-            self.crt_body_stream = CrtLazyReadStream(
-                meta.call_args.fileobj, "r+b", self.subscriber_manager)
-        elif meta.call_args.request_type == 'get_object':
-            self._file_stream = DeferredOpenFile(
-                meta.call_args.fileobj, mode='wb')
-
     @property
     def meta(self):
         return self._meta
 
-    def on_response_body(self, offset, chunk, **kwargs):
-        # if the file does not exist, create one? The subscriber will only create the directory?? Anybetter way?
-        self.subscriber_manager.on_progress(len(chunk))
-        if not os.path.exists(self.meta.call_args.fileobj):
-            # TODO error handling, and probably has a better way
-            open(self.meta.call_args.fileobj, 'a').close()
-        with open(self.meta.call_args.fileobj, 'rb+') as f:
-            f.seek(offset)
-            f.write(chunk)
-
     def on_done(self, **kwargs):
         self.subscriber_manager.on_done()
+
+    def on_progress(self, progress, **kwargs):
+        self.subscriber_manager.on_progress(progress)
 
     def set_s3_request(self, s3_request):
         self._s3_request = s3_request
