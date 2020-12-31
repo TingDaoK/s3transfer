@@ -17,12 +17,12 @@ import logging
 import sys
 import threading
 
-from s3transfer.compat import MAXINT, six
+from s3transfer.compat import MAXINT
+from s3transfer.compat import six
 from s3transfer.exceptions import CancelledError, TransferNotDoneError
-from s3transfer.utils import TaskSemaphore, FunctionContainer
-from s3transfer.crt import CrtSubscribersManager
+from s3transfer.utils import FunctionContainer
+from s3transfer.utils import TaskSemaphore
 
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -69,57 +69,6 @@ class BaseTransferMeta(object):
     def user_context(self):
         """A dictionary that requesters can store data in"""
         raise NotImplementedError('user_context')
-
-
-class CRTTransferFuture(BaseTransferFuture):
-    def __init__(self, s3_request=None, meta=None):
-        """The future associated to a submitted transfer request via CRT S3 client
-
-        :type s3_request: S3Request
-        :param s3_request: The s3_request, the CRT s3 request handles cancel and the finish future.
-
-        :type meta: TransferMeta
-        :param meta: The metadata associated to the request. This object
-            is visible to the requester.
-        """
-        self._s3_request = s3_request
-        self._crt_future = None
-        if s3_request:
-            self._crt_future = self._s3_request.finished_future
-        self._meta = meta
-        if meta is None:
-            self._meta = TransferMeta()
-        self.subscriber_manager = CrtSubscribersManager(
-            meta.call_args.subscribers, self)
-
-    @property
-    def meta(self):
-        return self._meta
-
-    def on_done(self, **kwargs):
-        self.subscriber_manager.on_done()
-
-    def on_progress(self, progress, **kwargs):
-        self.subscriber_manager.on_progress(progress)
-
-    def set_s3_request(self, s3_request):
-        self._s3_request = s3_request
-        self._crt_future = self._s3_request.finished_future
-
-    def done(self):
-        return self._crt_future.done()
-
-    def result(self):
-        try:
-            self._s3_request = None
-            return self._crt_future.result()
-        except KeyboardInterrupt as e:
-            self.cancel()
-            raise e
-
-    def cancel(self):
-        # TODO support cancel correctly for error handling
-        raise NotImplementedError('cancel')
 
 
 class TransferFuture(BaseTransferFuture):
@@ -173,7 +122,6 @@ class TransferFuture(BaseTransferFuture):
 
 class TransferMeta(BaseTransferMeta):
     """Holds metadata about the TransferFuture"""
-
     def __init__(self, call_args=None, transfer_id=None):
         self._call_args = call_args
         self._transfer_id = transfer_id
@@ -212,7 +160,6 @@ class TransferMeta(BaseTransferMeta):
 
 class TransferCoordinator(object):
     """A helper class for managing TransferFuture"""
-
     def __init__(self, transfer_id=None):
         self.transfer_id = transfer_id
         self._status = 'not-started'
@@ -564,7 +511,6 @@ class ExecutorFuture(object):
 
 class BaseExecutor(object):
     """Base Executor class implementation needed to work with s3transfer"""
-
     def __init__(self, max_workers=None):
         pass
 
@@ -577,7 +523,6 @@ class BaseExecutor(object):
 
 class NonThreadedExecutor(BaseExecutor):
     """A drop-in replacement non-threaded version of ThreadPoolExecutor"""
-
     def submit(self, fn, *args, **kwargs):
         future = NonThreadedExecutorFuture()
         try:
@@ -602,7 +547,6 @@ class NonThreadedExecutorFuture(object):
     Note that this future is **not** thread-safe as it is being used
     from the context of a non-threaded environment.
     """
-
     def __init__(self):
         self._result = None
         self._exception = None
