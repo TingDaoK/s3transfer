@@ -120,8 +120,7 @@ class CRTSubmitter(object):
         elif call_args.request_type == 'copy_object':
             serialized_request = self._client.copy_object(
                 CopySource=call_args.copy_source, Bucket=call_args.bucket, Key=call_args.key, **call_args.extra_args)["HTTPRequest"]
-        return self._executor.submit(
-            serialized_request, call_args)
+        return self._executor.submit(serialized_request, call_args)
 
 
 class CrtCredentialProviderWrapper():
@@ -192,7 +191,6 @@ class CRTExecutor(object):
                 content_type = call_args.extra_args['ContentType']
             crt_request.headers.set(
                 "Content-Type", content_type)
-            crt_request.body_stream = future.crt_body_stream
         # TODO CRT logs, may need to expose an option for user to enable/disable CRT log from CLI?
         log_name = "error_log.txt"
         if os.path.exists(log_name):
@@ -201,7 +199,8 @@ class CRTExecutor(object):
         init_logging(LogLevel.Error, log_name)
         s3_request = self._crt_client.make_request(request=crt_request,
                                                    type=type,
-                                                   on_body=future.on_response_body,
-                                                   on_done=future.on_done)
+                                                   file=call_args.fileobj,
+                                                   on_done=future.on_done,
+                                                   on_progress=future.on_progress)
         future.set_s3_request(s3_request)
         return future
