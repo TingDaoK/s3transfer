@@ -107,7 +107,8 @@ class CRTTransferFuture(BaseTransferFuture):
         """The future associated to a submitted transfer request via CRT S3 client
 
         :type s3_request: S3Request
-        :param s3_request: The s3_request, the CRT s3 request handles cancel and the finish future.
+        :param s3_request: The s3_request, the CRT s3 request handles cancel
+            and the finish future.
 
         :type meta: TransferMeta
         :param meta: The metadata associated to the request. This object
