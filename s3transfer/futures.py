@@ -19,7 +19,8 @@ import threading
 
 from s3transfer.compat import MAXINT, six
 from s3transfer.exceptions import CancelledError, TransferNotDoneError
-from s3transfer.utils import TaskSemaphore, DeferredOpenFile, FunctionContainer
+from s3transfer.utils import TaskSemaphore, FunctionContainer
+from s3transfer.crt import CrtSubscribersManager
 
 import os
 
@@ -68,40 +69,6 @@ class BaseTransferMeta(object):
     def user_context(self):
         """A dictionary that requesters can store data in"""
         raise NotImplementedError('user_context')
-
-
-class CrtSubscribersManager(object):
-    """
-    A simple wrapper to handle the subscriber for CRT
-    """
-
-    def __init__(self, subscribers=None, future=None):
-        self._subscribers = subscribers
-        self._future = future
-        self._on_queued_callbacks = self._get_callbacks("queued")
-        self._on_progress_callbacks = self._get_callbacks("progress")
-        self._on_done_callbacks = self._get_callbacks("done")
-
-    def _get_callbacks(self, callback_type):
-        callbacks = []
-        for subscriber in self._subscribers:
-            callback_name = 'on_' + callback_type
-            if hasattr(subscriber, callback_name):
-                callbacks.append(getattr(subscriber, callback_name))
-        return callbacks
-
-    def on_queued(self):
-        # On_queued seems not being useful for CRT.
-        for callback in self._on_queued_callbacks:
-            callback(self._future)
-
-    def on_progress(self, bytes_transferred):
-        for callback in self._on_progress_callbacks:
-            callback(self._future, bytes_transferred)
-
-    def on_done(self):
-        for callback in self._on_done_callbacks:
-            callback(self._future)
 
 
 class CRTTransferFuture(BaseTransferFuture):
