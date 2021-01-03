@@ -9,7 +9,7 @@ from botocore.config import Config
 from botocore.compat import urlsplit, six
 import awscrt.http
 from awscrt.s3 import S3Client, S3RequestType
-from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup
+from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup, init_logging, LogLevel
 from awscrt.auth import AwsCredentialsProvider
 
 from s3transfer.futures import BaseTransferFuture, TransferMeta
@@ -107,7 +107,8 @@ class CRTTransferFuture(BaseTransferFuture):
         """The future associated to a submitted transfer request via CRT S3 client
 
         :type s3_request: S3Request
-        :param s3_request: The s3_request, the CRT s3 request handles cancel and the finish future.
+        :param s3_request: The s3_request, the CRT s3 request handles cancel
+            and the finish future.
 
         :type meta: TransferMeta
         :param meta: The metadata associated to the request. This object
@@ -142,15 +143,21 @@ class CRTTransferFuture(BaseTransferFuture):
 
     def result(self):
         try:
+            result = self._crt_future.result()
             self._s3_request = None
-            return self._crt_future.result()
+            return result
         except KeyboardInterrupt as e:
-            self.cancel()
-            raise e
+            print("keyboard_error")
+            if self._s3_request:
+                self.cancel()
+                result = self._crt_future.result()
+                self._s3_request = None
+                return result
+            else:
+                raise e
 
     def cancel(self):
-        # TODO support cancel correctly for error handling
-        raise NotImplementedError('cancel')
+        self._s3_request.cancel()
 
 
 class CRTTransferManager(object):
@@ -332,10 +339,13 @@ class CRTExecutor(object):
         future = CRTTransferFuture(None, TransferMeta(call_args))
         future.subscriber_manager.on_queued()
 
+        file = None
         if call_args.request_type == 'get_object':
             type = S3RequestType.GET_OBJECT
+            file = call_args.fileobj
         elif call_args.request_type == 'put_object':
             type = S3RequestType.PUT_OBJECT
+            file = call_args.fileobj
         else:
             type = S3RequestType.DEFAULT
 
@@ -349,10 +359,16 @@ class CRTExecutor(object):
                 content_type = call_args.extra_args['ContentType']
             crt_request.headers.set(
                 "Content-Type", content_type)
+        # Log the error
+        log_name = "debug_log.txt"
+        if os.path.exists(log_name):
+            os.remove(log_name)
+
+        init_logging(LogLevel.Debug, log_name)
 
         s3_request = self._crt_client.make_request(
             request=crt_request, type=type,
-            file=call_args.fileobj, on_done=future.on_done,
+            file=file, on_done=future.on_done,
             on_progress=future.on_progress)
         future.set_s3_request(s3_request)
         return future
