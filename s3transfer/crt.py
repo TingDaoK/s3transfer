@@ -319,7 +319,6 @@ class CRTExecutor(object):
         def invoke_subscriber_callbacks(*args, **kwargs):
             for callback in get_callbacks(future, callback_type):
                 if callback_type == "progress":
-                    print(args[0])
                     callback(bytes_transferred=args[0])
                 else:
                     callback(*args, **kwargs)
