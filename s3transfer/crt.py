@@ -12,7 +12,7 @@ from awscrt.s3 import S3Client, S3RequestType
 from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup
 from awscrt.auth import AwsCredentialsProvider
 
-from s3transfer.futures import BaseTransferFuture, TransferMeta
+from s3transfer.futures import BaseTransferFuture, BaseTransferMeta
 from s3transfer.utils import CallArgs
 from s3transfer.utils import get_callbacks
 
@@ -55,10 +55,13 @@ class CRTUtil(object):
 class CRTTransferMeta(BaseTransferMeta):
     """Holds metadata about the CRTTransferFuture"""
 
-    def __init__(self, transfer_id, call_args):
+    def __init__(self, transfer_id=None, call_args=None):
         self._transfer_id = transfer_id
         self._call_args = call_args
         self._user_context = {}
+        # TODO: size of the transfer for download comes from the on_header
+        # callback
+        self._size = 10000000000
 
     @property
     def call_args(self):
@@ -71,6 +74,10 @@ class CRTTransferMeta(BaseTransferMeta):
     @property
     def user_context(self):
         return self._user_context
+
+    @property
+    def size(self):
+        return self._size
 
 
 class CRTTransferFuture(BaseTransferFuture):
@@ -120,7 +127,7 @@ class CRTTransferFuture(BaseTransferFuture):
 class CRTTransferConfig(object):
     def __init__(self,
                  max_bandwidth=None,
-                 multipart_chunksize=8 * MB,
+                 multipart_chunksize=0,
                  max_request_processes=0):
         """Configuration for the ProcessPoolDownloader
         :param max_bandwidth: The maximum bandwidth of the transfer manager
@@ -143,19 +150,22 @@ class CRTTransferManager(object):
         return self
 
     def __exit__(self, exc_type, exc_value, *args):
-        # Wait until all the transfer done, even if some fails and clean up all the underlying resource
+        # Wait until all the transfer done, even if some fails and clean up all
+        # the underlying resource
         for i in self._futures:
             i.result()
 
-    def __init__(self, session, config):
+    def __init__(self, session=None, config=None, crt_s3_client=None):
         """
         session: botocore.session
         config: CRTTransferConfig
         """
         self.config = config
+        region = None
+        if session:
+            region = session.get_config_variable("region")
         self._submitter = CRTSubmitter(
-            session, config, session.get_config_variable(
-                "region"))
+            session, config, region, crt_s3_client)
 
         self._futures = []
 
@@ -168,27 +178,24 @@ class CRTTransferManager(object):
         callargs = CallArgs(
             bucket=bucket, key=key, fileobj=fileobj,
             extra_args=extra_args, subscribers=subscribers)
-        return self._submit_transfer(callargs,
-                                     request_type="get_object")
+        return self._submit_transfer("get_object", callargs)
 
     def upload(self, bucket, key, fileobj, extra_args=None,
                subscribers=None):
         callargs = CallArgs(
             bucket=bucket, key=key, fileobj=fileobj,
             extra_args=extra_args, subscribers=subscribers)
-        return self._submit_transfer(callargs,
-                                     request_type="put_object")
+        return self._submit_transfer("put_object", callargs)
 
     def delete(self, bucket, key, extra_args=None,
                subscribers=None):
         callargs = CallArgs(
             bucket=bucket, key=key, extra_args=extra_args,
             subscribers=subscribers)
-        return self._submit_transfer(callargs,
-                                     request_type="delete_object")
+        return self._submit_transfer("delete_object", callargs)
 
-    def _submit_transfer(self, call_args, request_type):
-        future = self._submitter.submit(call_args, request_type)
+    def _submit_transfer(self, request_type, call_args):
+        future = self._submitter.submit(request_type, call_args)
         self._futures.append(future)
         return future
 
@@ -204,7 +211,7 @@ class FakeRawResponse(BytesIO):
 
 class CRTSubmitter(object):
     # using botocore client
-    def __init__(self, session, config, region):
+    def __init__(self, session, config, region, crt_s3_client):
         # Turn off the signing process and depends on the crt client to sign
         # the request
         client_config = Config(signature_version=UNSIGNED)
@@ -218,7 +225,7 @@ class CRTSubmitter(object):
             self._change_response_to_serialized_http_request)
         self._client.meta.events.register(
             'before-send.s3.*', self._make_fake_http_response)
-        self._executor = CRTExecutor(config, session, region)
+        self._executor = CRTExecutor(config, session, region, crt_s3_client)
 
     def _capture_http_request(self, request, **kwargs):
         request.context['http_request'] = request
@@ -236,7 +243,9 @@ class CRTSubmitter(object):
             FakeRawResponse(b""),
         )
 
-    def submit(self, call_args, request_type):
+    def submit(self, request_type, call_args):
+        if not call_args.extra_args:
+            call_args.extra_args = {}
         if request_type == 'get_object':
             serialized_request = self._client.get_object(
                 Bucket=call_args.bucket, Key=call_args.key,
@@ -255,7 +264,8 @@ class CRTSubmitter(object):
                 CopySource=call_args.copy_source,
                 Bucket=call_args.bucket, Key=call_args.key,
                 **call_args.extra_args)["HTTPRequest"]
-        return self._executor.submit(serialized_request, call_args)
+        return self._executor.submit(
+            serialized_request, request_type, call_args)
 
 
 class CrtCredentialProviderWrapper():
@@ -279,60 +289,69 @@ class CrtCredentialProviderWrapper():
 
 
 class CRTExecutor(object):
-    def __init__(self, configs=None, session=None, region=None):
+    def __init__(self, configs=None, session=None,
+                 region=None, crt_s3_client=None):
         # initialize crt client in here
-        event_loop_group = EventLoopGroup(
-            configs.max_request_processes)
-        host_resolver = DefaultHostResolver(event_loop_group)
-        bootstrap = ClientBootstrap(
-            event_loop_group, host_resolver)
-        provider = AwsCredentialsProvider.new_python(
-            CrtCredentialProviderWrapper(session))
+        if crt_s3_client is None:
+            event_loop_group = EventLoopGroup(
+                configs.max_request_processes)
+            host_resolver = DefaultHostResolver(event_loop_group)
+            bootstrap = ClientBootstrap(
+                event_loop_group, host_resolver)
+            provider = AwsCredentialsProvider.new_python(
+                CrtCredentialProviderWrapper(session))
+            target_gbps = 0
+            if configs.max_bandwidth:
+                # Translate bytes to gigabits
+                target_gbps = configs.max_bandwidth * 8 / (1000 * 1000)
 
-        target_gbps = 0
-        if configs.max_bandwidth:
-            # Translate bytes to gigabits
-            target_gbps = configs.max_bandwidth * 8 / (1000 * 1000)
-
-        self._crt_client = S3Client(
-            bootstrap=bootstrap,
-            region=region,
-            credential_provider=provider,
-            part_size=configs.multipart_chunksize,
-            throughput_target_gbps=target_gbps)
+            self._crt_client = S3Client(
+                bootstrap=bootstrap,
+                region=region,
+                credential_provider=provider,
+                part_size=configs.multipart_chunksize,
+                throughput_target_gbps=target_gbps)
+        else:
+            self._crt_client = crt_s3_client
 
     def _get_crt_callback(self, future, callback_type):
 
         def invoke_subscriber_callbacks(*args, **kwargs):
             for callback in get_callbacks(future, callback_type):
-                callback(future, *args, **kwargs)
+                if callback_type == "progress":
+                    print(args[0])
+                    callback(bytes_transferred=args[0])
+                else:
+                    callback(*args, **kwargs)
 
         return invoke_subscriber_callbacks
 
-    def submit(self, serialized_http_requests, call_args):
+    def submit(self, serialized_http_requests, request_type, call_args):
         logger.debug(serialized_http_requests)
-        crt_request = CrtUtil.crt_request_from_aws_request(
+        crt_request = CRTUtil.crt_request_from_aws_request(
             serialized_http_requests)
         if crt_request.headers.get("host") is None:
             # If host is not set, set it for the request before using CRT s3
             url_parts = urlsplit(serialized_http_requests.url)
             crt_request.headers.set("host", url_parts.netloc)
-        future = CRTTransferFuture(None, TransferMeta(call_args))
-        on_queued = self._get_crt_callback(future, 'on_queue')
+        future = CRTTransferFuture(None, CRTTransferMeta(call_args=call_args))
+        on_queued = self._get_crt_callback(future, 'queue')
         on_queued(None)
 
-        if call_args.request_type == 'get_object':
-            request_type = S3RequestType.GET_OBJECT
-        elif call_args.request_type == 'put_object':
-            request_type = S3RequestType.PUT_OBJECT
+        file = None
+        if request_type == 'get_object':
+            s3_meta_request_type = S3RequestType.GET_OBJECT
+            file = call_args.fileobj
+        elif request_type == 'put_object':
+            s3_meta_request_type = S3RequestType.PUT_OBJECT
+            file = call_args.fileobj
         else:
-            request_type = S3RequestType.DEFAULT
+            s3_meta_request_type = S3RequestType.DEFAULT
 
-        if request_type == S3RequestType.PUT_OBJECT:
-            file_stats = os.stat(call_args.fileobj)
+        if s3_meta_request_type == S3RequestType.PUT_OBJECT:
+            file_stats = os.stat(file)
             data_len = file_stats.st_size
-            crt_request.headers.set(
-                "Content-Length", str(data_len))
+            crt_request.headers.set("Content-Length", str(data_len))
             content_type = "text/plain"
             if 'ContentType' in call_args.extra_args:
                 content_type = call_args.extra_args['ContentType']
@@ -340,10 +359,10 @@ class CRTExecutor(object):
                 "Content-Type", content_type)
 
         s3_request = self._crt_client.make_request(
-            request=crt_request, type=request_type,
-            file=call_args.fileobj,
-            on_done=self._get_crt_callback(future, 'on_done'),
-            on_progress=self._get_crt_callback(future, 'on_progress')
+            request=crt_request, type=s3_meta_request_type,
+            file=file,
+            on_done=self._get_crt_callback(future, 'done'),
+            on_progress=self._get_crt_callback(future, 'progress')
         )
         future.set_s3_request(s3_request)
         return future
