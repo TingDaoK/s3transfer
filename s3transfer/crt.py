@@ -393,5 +393,4 @@ class CRTExecutor(object):
         pass
 
     def submit(self, crt_s3_client, crt_callargs):
-        s3_request = crt_s3_client.make_request(**crt_callargs)
-        return s3_request
+        return crt_s3_client.make_request(**crt_callargs)
