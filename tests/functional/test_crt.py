@@ -28,6 +28,8 @@ class TestCRTTransferManager(unittest.TestCase):
         future = self.transfer_manager.upload(
             self.bucket, self.key, self.filename, {}, [])
         future.result()
+        callargs = self.s3_crt_client.make_request.call_args
+        # TODO Assert on the callargs here
         self.s3_crt_client.make_request.assert_called_with(
             file=self.filename, type=S3RequestType.PUT_OBJECT)
 
