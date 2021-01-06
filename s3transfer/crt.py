@@ -120,8 +120,11 @@ class CRTTransferFuture(BaseTransferFuture):
 
     def result(self):
         try:
-            self._s3_request = None
-            return self._crt_future.result()
+            if self._s3_request:
+                result = self._crt_future.result()
+                self._s3_request = None
+                return result
+            return
         except KeyboardInterrupt as e:
             self.cancel()
             raise e
@@ -323,6 +326,11 @@ class CRTTransferManager(object):
                 future.result()
         except Exception:
             pass
+        shutdown_event = self._crt_s3_client.shutdown_event
+        del self._crt_s3_client
+        if not shutdown_event.wait(1):
+            # TODO throw an exception instead
+            print("something fucked up")
 
     def __init__(self, session=None, config=None, crt_s3_client=None):
         """
