@@ -166,7 +166,6 @@ class CRTS3ClientFactory:
             # Translate bytes to gigabits
             target_gbps = transfer_config.max_bandwidth * \
                 8 / (1000 * 1000 * 1000)
-            print(target_gbps)
 
         return S3Client(
             bootstrap=bootstrap,
