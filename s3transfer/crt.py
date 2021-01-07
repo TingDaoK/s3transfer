@@ -117,6 +117,8 @@ class CRTTransferManager(object):
 
         crt_callargs = self._s3_args_creator.get_make_request_args(
             request_type, call_args, future)
+        on_queued = self._get_crt_callback(future, 'queued')
+        on_queued()
         crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
 
         future.set_s3_request(crt_s3_request)
