@@ -21,14 +21,17 @@ logger = logging.getLogger(__name__)
 class CRTTransferConfig(object):
     def __init__(self,
                  max_bandwidth=None,
-                 multipart_chunksize=0,
-                 max_request_processes=0):
+                 multipart_chunksize=None,
+                 max_request_processes=None):
         """Configuration for the ProcessPoolDownloader
         :param max_bandwidth: The maximum bandwidth of the transfer manager
             will take.
-        :param multipart_chunksize: The chunk size of each ranged download.
-        :param max_request_processes: The maximum number of processes that
+        :param multipart_chunksize: The chunk size in Bytes of each ranged download.
+            Any transfer larger than this size will be separated into multipart
+            Default is 5 * 1024 * 1024
+        :param max_request_processes: The maximum number of threads that
             will be making S3 API transfer-related requests at a time.
+            Default is the number of processors
         """
         self.max_bandwidth = max_bandwidth
         self.multipart_chunksize = multipart_chunksize
@@ -40,13 +43,11 @@ class CRTTransferManager(object):
     Transfer manager based on CRT s3 client.
     """
 
-    def __init__(self, session=None, config=None, crt_s3_client=None):
-        """
-        session: botocore.session
-        config: CRTTransferConfig
-        """
+    def __init__(self, session, config=None, crt_s3_client=None):
         self._crt_credential_provider = \
             self._botocore_credential_provider_adaptor(session)
+        if config is None:
+            config = CRTTransferConfig()
         if crt_s3_client is None:
             crt_s3_client = self._create_crt_s3_client(session, config)
         self._crt_s3_client = crt_s3_client
@@ -108,13 +109,17 @@ class CRTTransferManager(object):
         client_factory = CRTS3ClientFactory()
         return client_factory.create_client(
             region=session.get_config_variable("region"),
+            client_config=session.get_default_client_config(),
             transfer_config=transfer_config,
-            botocore_credential_provider=self._crt_credential_provider
+            credential_provider=self._crt_credential_provider
         )
 
     def _submit_transfer(self, request_type, call_args):
+        # TODO unique id may be needed for the future.
         future = CRTTransferFuture(None, CRTTransferMeta(call_args=call_args))
 
+        # TODO Catch any exception happens during serialization and set the
+        # expection for
         crt_callargs = self._s3_args_creator.get_make_request_args(
             request_type, call_args, future)
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
@@ -185,12 +190,7 @@ class CRTTransferMeta(BaseTransferMeta):
         return self._size
 
     def provide_transfer_size(self, size):
-        """A method to provide the size of a transfer request
-
-        By providing this value, the TransferManager will not try to
-        call HeadObject or use the use OS to determine the size of the
-        transfer.
-        """
+        # TODO the size is not related to CRT, move this to CLI
         self._size = size
 
 
@@ -218,6 +218,8 @@ class CRTTransferFuture(BaseTransferFuture):
     def meta(self):
         return self._meta
 
+    # TODO remove this later, since it's not something we want user to have
+    # access to
     def set_s3_request(self, s3_request):
         self._s3_request = s3_request
         self._crt_future = self._s3_request.finished_future
@@ -243,14 +245,16 @@ class CRTTransferFuture(BaseTransferFuture):
 
 class CRTS3ClientFactory:
     def create_client(self, region, transfer_config=None,
-                      botocore_credential_provider=None):
+                      client_config=None,
+                      credential_provider=None):
+        # TODO client config is not resolved correctly.
         event_loop_group = EventLoopGroup(
             transfer_config.max_request_processes)
         host_resolver = DefaultHostResolver(event_loop_group)
         bootstrap = ClientBootstrap(
             event_loop_group, host_resolver)
         provider = AwsCredentialsProvider.new_delegate(
-            botocore_credential_provider)
+            credential_provider)
         target_gbps = 0
         if transfer_config.max_bandwidth:
             # Translate bytes to gigabits
@@ -280,8 +284,8 @@ class S3ClientArgsCreator:
         # the request
         client_config = Config(signature_version=UNSIGNED)
         self._client = session.create_client(
-            's3', config=client_config)  # Initialize client
-
+            's3', config=client_config)
+        self._os_utils = OSUtils()
         self._client.meta.events.register(
             'request-created.s3.*', self._capture_http_request)
         self._client.meta.events.register(
@@ -289,18 +293,19 @@ class S3ClientArgsCreator:
             self._change_response_to_serialized_http_request)
         self._client.meta.events.register(
             'before-send.s3.*', self._make_fake_http_response)
-        # initialize client with removed HTTP layer here
 
     def get_make_request_args(self, request_type, call_args, future):
-        file_path = None
+        recv_filepath = None
+        send_filepath = None
         s3_meta_request_type = getattr(
             S3RequestType,
             request_type.upper(),
             S3RequestType.DEFAULT)
-        if s3_meta_request_type != S3RequestType.DEFAULT:
-            file_path = call_args.fileobj
-        if s3_meta_request_type == S3RequestType.PUT_OBJECT:
-            data_len = OSUtils.get_file_size(file_path)
+        if s3_meta_request_type == S3RequestType.GET_OBJECT:
+            recv_filepath = call_args.fileobj
+        elif s3_meta_request_type == S3RequestType.PUT_OBJECT:
+            send_filepath = call_args.fileobj
+            data_len = self._os_utils.get_file_size(send_filepath)
             call_args.extra_args["ContentLength"] = data_len
 
         botocore_http_request = self._get_botocore_http_request(
@@ -310,7 +315,8 @@ class S3ClientArgsCreator:
         return {
             'request': crt_request,
             'type': s3_meta_request_type,
-            'file': file_path,
+            'recv_filepath': recv_filepath,
+            'send_filepath': send_filepath,
             'on_done': self.get_crt_callback(future, 'done'),
             'on_progress': self.get_crt_callback(future, 'progress')
         }
