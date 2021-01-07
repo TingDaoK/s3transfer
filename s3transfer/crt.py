@@ -10,7 +10,7 @@ from botocore.compat import urlsplit
 import awscrt.http
 from awscrt.s3 import S3Client, S3RequestType
 from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup
-from awscrt.auth import AwsCredentialsProvider
+from awscrt.auth import AwsCredentialsProvider, AwsCredentials
 
 from s3transfer.futures import BaseTransferFuture, BaseTransferMeta
 from s3transfer.utils import CallArgs
@@ -159,7 +159,7 @@ class CRTS3ClientFactory:
         host_resolver = DefaultHostResolver(event_loop_group)
         bootstrap = ClientBootstrap(
             event_loop_group, host_resolver)
-        provider = AwsCredentialsProvider.new_python(
+        provider = AwsCredentialsProvider.new_delegate(
             botocore_credential_provider)
         target_gbps = 0
         if transfer_config.max_bandwidth:
@@ -182,26 +182,6 @@ class FakeRawResponse(BytesIO):
             if not chunk:
                 break
             yield chunk
-
-
-class CrtCredentialProviderWrapper():
-    """
-    Provides the credential for CRT.
-    CRT will invoke get_credential method and
-    expected a dictionary return value back.
-    """
-
-    def __init__(self, session=None):
-        self._session = session
-
-    def get_credential(self):
-        credentials = self._session.get_credentials().get_frozen_credentials()
-
-        return {
-            "AccessKeyId": credentials.access_key,
-            "SecretAccessKey": credentials.secret_key,
-            "SessionToken": credentials.token
-        }
 
 
 class S3ClientArgsCreator:
@@ -329,7 +309,7 @@ class CRTTransferManager(object):
             pass
         shutdown_event = self._crt_s3_client.shutdown_event
         del self._crt_s3_client
-        if not shutdown_event.wait(1):
+        if not shutdown_event.wait(10):
             # TODO throw an exception instead
             print("something fucked up")
 
@@ -338,7 +318,8 @@ class CRTTransferManager(object):
         session: botocore.session
         config: CRTTransferConfig
         """
-        self._crt_credential_provider = CrtCredentialProviderWrapper(session)
+        self._crt_credential_provider = \
+            self._botocore_credential_provider_adaptor(session)
         if crt_s3_client is None:
             crt_s3_client = self._create_crt_s3_client(session, config)
         self._crt_s3_client = crt_s3_client
@@ -346,6 +327,15 @@ class CRTTransferManager(object):
 
         self._s3_args_creator = S3ClientArgsCreator(session)
         self._futures = []
+
+    def _botocore_credential_provider_adaptor(self, session):
+
+        def provider():
+            credentials = session.get_credentials().get_frozen_credentials()
+            return AwsCredentials(credentials.access_key,
+                                  credentials.secret_key, credentials.token)
+
+        return provider
 
     def _create_crt_s3_client(self, session, transfer_config):
         client_factory = CRTS3ClientFactory()
@@ -402,4 +392,10 @@ class CRTExecutor(object):
         pass
 
     def submit(self, crt_s3_client, crt_callargs):
+        # Log the error
+        log_name = "debug_log.txt"
+        if os.path.exists(log_name):
+            os.remove(log_name)
+
+        init_logging(LogLevel.Debug, log_name)
         return crt_s3_client.make_request(**crt_callargs)
