@@ -316,7 +316,12 @@ class S3ClientArgsCreator:
     def get_crt_callback(self, future, callback_type):
 
         def invoke_subscriber_callbacks(*args, **kwargs):
-            for callback in get_callbacks(future, callback_type):
+            # TODO The get_callbacks helper will set the first augment
+            # by keyword, the other augments need to be set by keyword
+            # as well. Consider removing the restriction later
+            if callback_type == "progress":
+                callback(bytes_transferred=args[0])
+            else:
                 callback(*args, **kwargs)
 
         return invoke_subscriber_callbacks
