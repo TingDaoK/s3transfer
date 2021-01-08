@@ -43,15 +43,17 @@ class CRTTransferManager(object):
     Transfer manager based on CRT s3 client.
     """
 
-    def __init__(self, session, config=None, crt_s3_client=None):
+    def __init__(self, session, config=None, osutil=None, crt_s3_client=None):
         self._crt_credential_provider = \
             self._botocore_credential_provider_adaptor(session)
         if config is None:
             config = CRTTransferConfig()
         if crt_s3_client is None:
             crt_s3_client = self._create_crt_s3_client(session, config)
+        if osutil is None:
+            self._osutil = OSUtils()
         self._crt_s3_client = crt_s3_client
-        self._s3_args_creator = S3ClientArgsCreator(session)
+        self._s3_args_creator = S3ClientArgsCreator(session, self._osutil)
         self._futures = []
 
     def __enter__(self):
@@ -116,12 +118,17 @@ class CRTTransferManager(object):
 
     def _submit_transfer(self, request_type, call_args):
         # TODO unique id may be needed for the future.
-        future = CRTTransferFuture(None, CRTTransferMeta(call_args=call_args))
+        download_file_manager = None
+        if request_type == "get_object":
+            download_file_manager = CRTDownloadFilenameOutputManager(
+                self._osutil)
+        future = CRTTransferFuture(None, CRTTransferMeta(
+            call_args=call_args), download_file_manager)
 
         # TODO Catch any exception happens during serialization and set the
         # expection for
         crt_callargs = self._s3_args_creator.get_make_request_args(
-            request_type, call_args, future)
+            request_type, call_args, future, download_file_manager)
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
         on_queued()
         crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
@@ -195,7 +202,7 @@ class CRTTransferMeta(BaseTransferMeta):
 
 
 class CRTTransferFuture(BaseTransferFuture):
-    def __init__(self, s3_request=None, meta=None):
+    def __init__(self, s3_request=None, meta=None, download_file_manager=None):
         """The future associated to a submitted transfer request via CRT S3 client
 
         :type s3_request: S3Request
@@ -213,6 +220,7 @@ class CRTTransferFuture(BaseTransferFuture):
         self._meta = meta
         if meta is None:
             self._meta = CRTTransferMeta()
+        self._file_manager = download_file_manager
 
     @property
     def meta(self):
@@ -228,26 +236,34 @@ class CRTTransferFuture(BaseTransferFuture):
         return self._crt_future.done()
 
     def result(self):
-        try:
-            if self._s3_request:
+        if self._s3_request:
+            try:
                 result = self._crt_future.result()
+                if self._file_manager:
+                    self._file_manager.complete_rename()
                 self._s3_request = None
                 return result
-            return
-        except KeyboardInterrupt as e:
-            if self._s3_request:
-                self.cancel()
-                try:
-                    self._crt_future.result()
-                except Exception:
-                    pass
-                self._s3_request = None
-                return
-            else:
-                raise e
+            except KeyboardInterrupt as e:
+                if self._s3_request:
+                    self.cancel()
+                    try:
+                        self._crt_future.result()
+                    except Exception:
+                        pass
+                    self._s3_request = None
+                    return
+                else:
+                    raise e
+            # TODO other expection will need to
+            # clean the tempery file as well
 
     def cancel(self):
         self._s3_request.cancel()
+        self._clean_up()
+
+    def _clean_up(self):
+        if self._file_manager:
+            self._file_manager.clear_tempfile()
 
 
 class CRTS3ClientFactory:
@@ -286,13 +302,13 @@ class FakeRawResponse(BytesIO):
 
 
 class S3ClientArgsCreator:
-    def __init__(self, session):
+    def __init__(self, session, os_utils):
         # Turn off the signing process and depends on the crt client to sign
         # the request
         client_config = Config(signature_version=UNSIGNED)
         self._client = session.create_client(
             's3', config=client_config)
-        self._os_utils = OSUtils()
+        self._os_utils = os_utils
         self._client.meta.events.register(
             'request-created.s3.*', self._capture_http_request)
         self._client.meta.events.register(
@@ -301,7 +317,8 @@ class S3ClientArgsCreator:
         self._client.meta.events.register(
             'before-send.s3.*', self._make_fake_http_response)
 
-    def get_make_request_args(self, request_type, call_args, future):
+    def get_make_request_args(
+            self, request_type, call_args, future, download_file_manager):
         recv_filepath = None
         send_filepath = None
         s3_meta_request_type = getattr(
@@ -309,7 +326,8 @@ class S3ClientArgsCreator:
             request_type.upper(),
             S3RequestType.DEFAULT)
         if s3_meta_request_type == S3RequestType.GET_OBJECT:
-            recv_filepath = call_args.fileobj
+            recv_filepath = download_file_manager.get_filename_for_io_writes(
+                call_args.fileobj)
         elif s3_meta_request_type == S3RequestType.PUT_OBJECT:
             send_filepath = call_args.fileobj
             data_len = self._os_utils.get_file_size(send_filepath)
@@ -368,5 +386,22 @@ class S3ClientArgsCreator:
     def _get_botocore_http_request(self, client_method, call_args):
         return getattr(self._client, client_method)(
             Bucket=call_args.bucket, Key=call_args.key,
-            **call_args.extra_args
-        )['HTTPRequest']
+            **call_args.extra_args)['HTTPRequest']
+
+
+class CRTDownloadFilenameOutputManager:
+    def __init__(self, osutil):
+        self._osutil = osutil
+        self._final_filename = None
+        self._temp_filename = None
+
+    def get_filename_for_io_writes(self, filename):
+        self._final_filename = filename
+        self._temp_filename = self._osutil.get_temp_filename(filename)
+        return self._temp_filename
+
+    def complete_rename(self):
+        self._osutil.rename_file(self._temp_filename, self._final_filename)
+
+    def clear_tempfile(self):
+        self._osutil.remove_file(self._temp_filename)
