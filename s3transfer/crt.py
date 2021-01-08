@@ -23,16 +23,8 @@ class CRTTransferConfig(object):
                  max_bandwidth=None,
                  multipart_chunksize=None,
                  max_request_processes=None):
-        """Configuration for the ProcessPoolDownloader
-        :param max_bandwidth: The maximum bandwidth of the transfer manager
-            will take.
-        :param multipart_chunksize: The chunk size in Bytes of each ranged download.
-            Any transfer larger than this size will be separated into multipart
-            Default is 5 * 1024 * 1024
-        :param max_request_processes: The maximum number of threads that
-            will be making S3 API transfer-related requests at a time.
-            Default is the number of processors
-        """
+        # TODO rename max_bandwidth and max_request_processes for more
+        # appropriate description
         self.max_bandwidth = max_bandwidth
         self.multipart_chunksize = multipart_chunksize
         self.max_request_processes = max_request_processes
@@ -120,10 +112,10 @@ class CRTTransferManager(object):
 
         # TODO Catch any exception happens during serialization and set the
         # expection for
-        crt_callargs = self._s3_args_creator.get_make_request_args(
-            request_type, call_args, future)
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
         on_queued()
+        crt_callargs = self._s3_args_creator.get_make_request_args(
+            request_type, call_args, future)
         crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
 
         future.set_s3_request(crt_s3_request)
@@ -325,10 +317,7 @@ class S3ClientArgsCreator:
 
         def invoke_subscriber_callbacks(*args, **kwargs):
             for callback in get_callbacks(future, callback_type):
-                if callback_type == "progress":
-                    callback(bytes_transferred=args[0])
-                else:
-                    callback(*args, **kwargs)
+                callback(*args, **kwargs)
 
         return invoke_subscriber_callbacks
 
