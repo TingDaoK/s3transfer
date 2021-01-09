@@ -58,10 +58,10 @@ class CRTTransferManager(object):
                 future.result()
         except Exception:
             pass
-        self._futures = None
-        shutdown_event = self._crt_s3_client.shutdown_event
-        self._crt_s3_client = None
-        shutdown_event.wait(1)
+        else:
+            shutdown_event = self._crt_s3_client.shutdown_event
+            self._crt_s3_client = None
+            shutdown_event.wait()
 
     def download(self, bucket, key, fileobj, extra_args=None,
                  subscribers=None):
@@ -231,20 +231,21 @@ class CRTTransferFuture(BaseTransferFuture):
         if self._s3_request:
             try:
                 self._crt_future.result()
-                if self._file_manager:
-                    self._file_manager.complete_rename()
-                self._s3_request = None
-            except KeyboardInterrupt as e:
+            except KeyboardInterrupt:
                 if self._s3_request:
                     self._s3_request.cancel()
                     self._crt_future.result()
-                    self._s3_request = None
                     self._clean_up()
                 else:
-                    raise e
+                    raise
             except Exception:
                 self._clean_up()
                 raise
+            else:
+                if self._file_manager:
+                    self._file_manager.complete_rename()
+            finally:
+                self._s3_request = None
 
     def _clean_up(self):
         if self._file_manager:
@@ -337,10 +338,11 @@ class S3ClientArgsCreator:
             # TODO The get_callbacks helper will set the first augment
             # by keyword, the other augments need to be set by keyword
             # as well. Consider removing the restriction later
-            if callback_type == "progress":
-                callback(bytes_transferred=args[0])
-            else:
-                callback(*args, **kwargs)
+            for callback in get_callbacks(future, callback_type):
+                if callback_type == "progress":
+                    callback(bytes_transferred=args[0])
+                else:
+                    callback(*args, **kwargs)
 
         return invoke_subscriber_callbacks
 
@@ -388,7 +390,14 @@ class CRTDownloadFilenameOutputManager:
         return self._temp_filename
 
     def complete_rename(self):
-        self._osutil.rename_file(self._temp_filename, self._final_filename)
+        try:
+            self._osutil.rename_file(self._temp_filename, self._final_filename)
+        except Exception:
+            # Not raising any error
+            pass
 
     def clear_tempfile(self):
-        self._osutil.remove_file(self._temp_filename)
+        try:
+            self._osutil.remove_file(self._temp_filename)
+        except Exception:
+            pass
