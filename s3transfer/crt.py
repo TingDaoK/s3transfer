@@ -1,5 +1,4 @@
 import logging
-import os
 from io import BytesIO
 
 import botocore.awsrequest
@@ -67,9 +66,10 @@ class CRTTransferManager(object):
                 future.result()
         except Exception:
             pass
+        self._futures = None
         shutdown_event = self._crt_s3_client.shutdown_event
         self._crt_s3_client = None
-        shutdown_event.wait()
+        shutdown_event.wait(1)
 
     def download(self, bucket, key, fileobj, extra_args=None,
                  subscribers=None):
@@ -238,28 +238,21 @@ class CRTTransferFuture(BaseTransferFuture):
     def result(self):
         if self._s3_request:
             try:
-                result = self._crt_future.result()
+                self._crt_future.result()
                 if self._file_manager:
                     self._file_manager.complete_rename()
                 self._s3_request = None
-                return result
             except KeyboardInterrupt as e:
                 if self._s3_request:
-                    self.cancel()
-                    try:
-                        self._crt_future.result()
-                    except Exception:
-                        pass
+                    self._s3_request.cancel()
+                    self._crt_future.result()
                     self._s3_request = None
-                    return
+                    self._clean_up()
                 else:
                     raise e
-            # TODO other expection will need to
-            # clean the tempery file as well
-
-    def cancel(self):
-        self._s3_request.cancel()
-        self._clean_up()
+            except Exception:
+                self._clean_up()
+                raise
 
     def _clean_up(self):
         if self._file_manager:
