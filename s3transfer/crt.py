@@ -59,6 +59,8 @@ class CRTTransferManager(object):
         except Exception:
             pass
         else:
+            # Only do gracefully shutdown for CRT when no error happens
+            # C land will not crash now
             shutdown_event = self._crt_s3_client.shutdown_event
             self._crt_s3_client = None
             shutdown_event.wait()
@@ -232,20 +234,21 @@ class CRTTransferFuture(BaseTransferFuture):
             try:
                 self._crt_future.result()
             except KeyboardInterrupt:
-                if self._s3_request:
-                    self._s3_request.cancel()
-                    self._crt_future.result()
-                    self._clean_up()
-                else:
-                    raise
+                self.cancel()
+                raise
             except Exception:
                 self._clean_up()
                 raise
             else:
                 if self._file_manager:
                     self._file_manager.complete_rename()
-            finally:
                 self._s3_request = None
+
+    def cancel(self):
+        if self._s3_request:
+            self._s3_request.cancel()
+            self._crt_future.result()
+            self._clean_up()
 
     def _clean_up(self):
         if self._file_manager:
