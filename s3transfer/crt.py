@@ -103,6 +103,7 @@ class CRTTransferManager(object):
 
     def _create_crt_s3_client(self, session, transfer_config):
         client_factory = CRTS3ClientFactory()
+        # TODO create client may fail, propagate the error properly
         return client_factory.create_client(
             region=session.get_config_variable("region"),
             client_config=session.get_default_client_config(),
@@ -119,12 +120,13 @@ class CRTTransferManager(object):
         future = CRTTransferFuture(None, CRTTransferMeta(
             call_args=call_args), download_file_manager)
 
-        # TODO Catch any exception happens during serialization and set the
-        # expection for
+        # TODO Catch any exception happens during serialization and
+        # make_request call
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
         on_queued()
         crt_callargs = self._s3_args_creator.get_make_request_args(
             request_type, call_args, future, download_file_manager)
+        # The make request call can fail with exception raised.
         crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
 
         future.set_s3_request(crt_s3_request)
@@ -331,7 +333,8 @@ class S3ClientArgsCreator:
             'type': s3_meta_request_type,
             'recv_filepath': recv_filepath,
             'send_filepath': send_filepath,
-            'on_done': self.get_crt_callback(future, 'done'),
+            'on_done': "done",
+            # 'on_done': self.get_crt_callback(future, 'done'),
             'on_progress': self.get_crt_callback(future, 'progress')
         }
 
