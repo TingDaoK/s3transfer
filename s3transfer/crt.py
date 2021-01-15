@@ -116,17 +116,15 @@ class CRTTransferManager(object):
             self._cancel_futures()
         except Exception:
             pass
-        else:
-            # TODO should be able to do gracefully shutdown even
-            # exception happens. But it's working without crash
-            # right now.
-            self._shutdown_crt_client()
+        finally:
+            # TODO it should not be timeout
+            self._shutdown_crt_client(2)
 
-    def _shutdown_crt_client(self):
+    def _shutdown_crt_client(self, timeout):
         shutdown_event = self._crt_s3_client.shutdown_event
         self._crt_s3_client = None
         if self._owns_crt_client:
-            shutdown_event.wait()
+            shutdown_event.wait(timeout)
 
     def _botocore_credential_provider_adaptor(self, session):
 
@@ -257,16 +255,15 @@ class CRTTransferCoordinator:
     def result(self, timeout):
         if self._exception:
             raise self._exception
-        elif self._s3_request:
-            try:
-                self._crt_future.result(timeout)
-            except KeyboardInterrupt:
-                self.cancel()
-                raise
-            else:
+        try:
+            self._crt_future.result(timeout)
+        except KeyboardInterrupt:
+            self.cancel()
+            raise
+        finally:
+            if self._s3_request:
                 self._s3_request = None
-            finally:
-                self._crt_future.result(timeout)
+            self._crt_future.result(timeout)
 
     def done(self):
         if self._crt_future is None:
