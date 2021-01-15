@@ -416,6 +416,10 @@ class S3ClientArgsCreator:
             # If host is not set, set it for the request before using CRT s3
             url_parts = urlsplit(botocore_http_request.url)
             crt_request.headers.set("host", url_parts.netloc)
+        try:
+            crt_request.headers.remove("Content-MD5")
+        except Exception:
+            pass
         return crt_request
 
     def _capture_http_request(self, request, **kwargs):
