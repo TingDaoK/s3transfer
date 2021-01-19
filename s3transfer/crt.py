@@ -1,6 +1,7 @@
 import logging
 from io import BytesIO
 import threading
+from concurrent.futures import Future
 
 import botocore.awsrequest
 import botocore.session
@@ -54,6 +55,7 @@ class CRTTransferManager(object):
         self._crt_s3_client = crt_s3_client
         self._s3_args_creator = S3ClientArgsCreator(session, self._osutil)
         self._futures = []
+        self._done_futures = []
 
     def __enter__(self):
         return self
@@ -116,17 +118,12 @@ class CRTTransferManager(object):
             self._cancel_futures()
         except Exception:
             pass
-        else:
-            # TODO should be able to do gracefully shutdown even
-            # exception happens. But it's working without crash
-            # right now.
-            self._shutdown_crt_client()
+        finally:
+            self._crt_done()
 
-    def _shutdown_crt_client(self):
-        shutdown_event = self._crt_s3_client.shutdown_event
-        self._crt_s3_client = None
-        if self._owns_crt_client:
-            shutdown_event.wait()
+    def _crt_done(self):
+        for future in self._done_futures:
+            future.result()
 
     def _botocore_credential_provider_adaptor(self, session):
 
@@ -152,12 +149,14 @@ class CRTTransferManager(object):
         future = CRTTransferFuture(CRTTransferMeta(
             call_args=call_args), coordinator)
 
+        done_future = Future()
+
         # TODO get_make_request_args and on_queue can fail from botocore.
         # Handle the error properly
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
         on_queued()
         crt_callargs = self._s3_args_creator.get_make_request_args(
-            request_type, call_args, coordinator, future, self._osutil)
+            request_type, call_args, coordinator, future, done_future, self._osutil)
 
         try:
             crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
@@ -168,6 +167,7 @@ class CRTTransferManager(object):
         else:
             coordinator.set_s3_request(crt_s3_request)
         self._futures.append(future)
+        self._done_futures.append(done_future)
         return future
 
 
@@ -257,16 +257,15 @@ class CRTTransferCoordinator:
     def result(self, timeout):
         if self._exception:
             raise self._exception
-        elif self._s3_request:
-            try:
-                self._crt_future.result(timeout)
-            except KeyboardInterrupt:
-                self.cancel()
-                raise
-            else:
+        try:
+            self._crt_future.result(timeout)
+        except KeyboardInterrupt:
+            self.cancel()
+            raise
+        finally:
+            if self._s3_request:
                 self._s3_request = None
-            finally:
-                self._crt_future.result(timeout)
+            self._crt_future.result(timeout)
 
     def done(self):
         if self._crt_future is None:
@@ -357,24 +356,29 @@ class S3ClientArgsCreator:
             'before-send.s3.*', self._make_fake_http_response)
 
     def get_make_request_args(
-            self, request_type, call_args, coordinator, future, osutil):
+            self, request_type, call_args, coordinator,
+            future, done_future, osutil):
         recv_filepath = None
         send_filepath = None
         s3_meta_request_type = getattr(
             S3RequestType,
             request_type.upper(),
             S3RequestType.DEFAULT)
-        on_done_before_call = []
+        on_done_before_subs = []
+        on_done_after_subs = []
         if s3_meta_request_type == S3RequestType.GET_OBJECT:
             final_filepath = call_args.fileobj
             recv_filepath = osutil.get_temp_filename(final_filepath)
-            file_ondone_call = RenameTempFileHandler(
+            file_on_done_call = RenameTempFileHandler(
                 coordinator, final_filepath, recv_filepath, osutil)
-            on_done_before_call.append(file_ondone_call)
+            on_done_before_subs.append(file_on_done_call)
         elif s3_meta_request_type == S3RequestType.PUT_OBJECT:
             send_filepath = call_args.fileobj
             data_len = self._os_utils.get_file_size(send_filepath)
             call_args.extra_args["ContentLength"] = data_len
+
+        after_on_done_call = AfterDoneHandler(done_future)
+        on_done_after_subs.append(after_on_done_call)
 
         botocore_http_request = self._get_botocore_http_request(
             request_type, call_args)
@@ -386,7 +390,8 @@ class S3ClientArgsCreator:
             'recv_filepath': recv_filepath,
             'send_filepath': send_filepath,
             'on_done': self.get_crt_callback(future, 'done',
-                                             on_done_before_call),
+                                             on_done_before_subs,
+                                             on_done_after_subs),
             'on_progress': self.get_crt_callback(future, 'progress')
         }
 
@@ -419,6 +424,10 @@ class S3ClientArgsCreator:
             # If host is not set, set it for the request before using CRT s3
             url_parts = urlsplit(botocore_http_request.url)
             crt_request.headers.set("host", url_parts.netloc)
+        try:
+            crt_request.headers.remove("Content-MD5")
+        except Exception:
+            pass
         return crt_request
 
     def _capture_http_request(self, request, **kwargs):
@@ -462,3 +471,11 @@ class RenameTempFileHandler:
                 self._osutil.remove_file(self._temp_filename)
                 # the CRT future has done already at this point
                 self._coordinator.set_exception(e)
+
+
+class AfterDoneHandler:
+    def __init__(self, future):
+        self._future = future
+
+    def __call__(self, **kwargs):
+        self._future.set_result(None)
