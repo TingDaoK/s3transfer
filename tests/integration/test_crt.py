@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import os
+import glob
 
 from tests.integration import BaseTransferManagerIntegTest
 from tests import assert_files_equal
@@ -224,3 +225,56 @@ class TestCRTS3Transfers(BaseTransferManagerIntegTest):
                 transfer.delete(self.bucket_name, key)
         for key in keys:
             self.assertTrue(self.object_not_exists(key))
+
+    def test_upload_cancel(self):
+        config = crt.CRTTransferConfig(
+            multipart_chunksize=5 * 1024 * 1024)
+        transfer = self.create_s3_transfer(config)
+        filename = self.files.create_file_with_size(
+            '20mb.txt', filesize=20 * 1024 * 1024)
+        future = None
+        try:
+            with transfer:
+                future = transfer.upload(self.bucket_name,
+                                         '20mb.txt', filename)
+                raise KeyboardInterrupt()
+        except KeyboardInterrupt:
+            pass
+
+        try:
+            future.result()
+        except Exception as e:
+            self.assertTrue("AwsCrtError" in str(e))
+            self.assertEqual(e.name, "AWS_ERROR_S3_CANCELED")
+            self.assertTrue(self.object_not_exists('20mb.txt'))
+        else:
+            # Failed
+            self.assertTrue(False)
+
+    def test_download_cancel(self):
+        transfer = self.create_s3_transfer()
+        filename = self.files.create_file_with_size(
+            'foo.txt', filesize=20 * 1024 * 1024)
+        self.upload_file(filename, 'foo.txt')
+
+        download_path = os.path.join(self.files.rootdir, 'downloaded.txt')
+        future = None
+        try:
+            with transfer:
+                future = transfer.download(self.bucket_name, 'foo.txt',
+                                           download_path)
+                raise KeyboardInterrupt()
+        except KeyboardInterrupt:
+            pass
+
+        try:
+            future.result()
+        except Exception as e:
+            self.assertTrue("AwsCrtError" in str(e))
+            self.assertEqual(e.name, "AWS_ERROR_S3_CANCELED")
+        else:
+            # Failed
+            self.assertTrue(False)
+
+        possible_matches = glob.glob('%s*' % download_path)
+        self.assertEqual(possible_matches, [])
