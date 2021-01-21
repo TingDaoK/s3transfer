@@ -119,14 +119,13 @@ class CRTTransferManager(object):
         except Exception:
             pass
         finally:
-            # TODO it should not be timeout
-            self._shutdown_crt_client(2)
+            self._shutdown_crt_client()
 
-    def _shutdown_crt_client(self, timeout):
+    def _shutdown_crt_client(self):
         shutdown_event = self._crt_s3_client.shutdown_event
         self._crt_s3_client = None
         if self._owns_crt_client:
-            shutdown_event.wait(timeout)
+            shutdown_event.wait()
 
     def _botocore_credential_provider_adaptor(self, session):
 
@@ -428,6 +427,7 @@ class S3ClientArgsCreator:
             url_parts = urlsplit(botocore_http_request.url)
             crt_request.headers.set("host", url_parts.netloc)
         try:
+            # TODO remove this once native client supports MD5
             crt_request.headers.remove("Content-MD5")
         except Exception:
             pass

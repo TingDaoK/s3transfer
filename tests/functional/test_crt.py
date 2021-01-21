@@ -36,24 +36,24 @@ class delayFutureThread(threading.Thread):
 
 class TestCRTTransferManager(unittest.TestCase):
     def setUp(self):
-        self.s3_request = mock.Mock(S3Request)
-        self.s3_crt_client = mock.Mock(S3Client)
-        self.s3_crt_client.make_request.return_value = self.s3_request
-        self.session = Session()
         self.max_request_processes = 2
-        config = CRTTransferConfig(self.max_request_processes)
-        self.transfer_manager = CRTTransferManager(
-            crt_s3_client=self.s3_crt_client, session=self.session,
-            config=config)
         self.region = 'us-west-2'
-        self.session = Session()
-        self.session.set_config_variable('region', self.region)
         self.bucket = "test_bucket"
         self.key = "test_key"
         self.files = FileCreator()
         self.filename = self.files.create_file('myfile', 'my content')
         self.expected_path = "/" + self.bucket + "/" + self.key
         self.expected_host = "s3.%s.amazonaws.com" % (self.region)
+        self.s3_request = mock.Mock(S3Request)
+        self.s3_crt_client = mock.Mock(S3Client)
+        self.s3_crt_client.make_request.return_value = self.s3_request
+        self.session = Session()
+        config = CRTTransferConfig(self.max_request_processes)
+        self.transfer_manager = CRTTransferManager(
+            crt_s3_client=self.s3_crt_client, session=self.session,
+            config=config)
+        self.session = Session()
+        self.session.set_config_variable('region', self.region)
 
     def tearDown(self):
         self.files.remove_all()
