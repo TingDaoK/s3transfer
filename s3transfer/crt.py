@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class CRTTransferConfig(object):
     def __init__(self,
-                 max_request_queue_size=1000,
+                 max_request_queue_size=32,
                  max_bandwidth=None,
                  multipart_chunksize=None,
                  max_request_processes=None):
@@ -150,7 +150,6 @@ class CRTTransferManager(object):
 
     def _submit_transfer(self, request_type, call_args):
         # TODO unique id may be needed for the future.
-        self._semaphore.acquire()
         on_done_after_calls = [self._release_semaphore]
         coordinator = CRTTransferCoordinator()
         future = CRTTransferFuture(CRTTransferMeta(
@@ -165,6 +164,7 @@ class CRTTransferManager(object):
             self._osutil, on_done_after_calls)
 
         try:
+            self._semaphore.acquire()
             crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
         except Exception as e:
             coordinator.set_exception(e, True)
@@ -426,11 +426,8 @@ class S3ClientArgsCreator:
             # If host is not set, set it for the request before using CRT s3
             url_parts = urlsplit(botocore_http_request.url)
             crt_request.headers.set("host", url_parts.netloc)
-        try:
-            # TODO remove this once native client supports MD5
+        if crt_request.headers.get('Content-MD5') is not None:
             crt_request.headers.remove("Content-MD5")
-        except Exception:
-            pass
         return crt_request
 
     def _capture_http_request(self, request, **kwargs):

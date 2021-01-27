@@ -105,7 +105,7 @@ class TestCRTTransferManager(unittest.TestCase):
         self.assertEqual(self.expected_path, crt_request.path)
         self.assertEqual(self.expected_host, crt_request.headers.get("host"))
 
-    def test_concurrent(self):
+    def test_blocks_when_max_requests_processes_reached(self):
         futures = []
         callargs = (self.bucket, self.key, self.filename, {}, [])
         all_concurrent = 3
@@ -114,23 +114,28 @@ class TestCRTTransferManager(unittest.TestCase):
             thread = submitThread(self.transfer_manager, futures, callargs)
             thread.start()
             threads.append(thread)
-        self.assertEqual(
+        self.assertLessEqual(
             self.s3_crt_client.make_request.call_count,
             self.max_request_processes)
         # Release lock
-        self.transfer_manager._release_semaphore()
+        callargs = self.s3_crt_client.make_request.call_args
+        callargs_kwargs = callargs[1]
+        on_done = callargs_kwargs["on_done"]
+        on_done(error=None)
         for thread in threads:
             thread.join()
         self.assertEqual(
             self.s3_crt_client.make_request.call_count,
             all_concurrent)
-        for future in futures:
-            future.result()
+
+    def _cancel_function(self):
+        self.cancel_called = True
+        self.s3_request.finished_future.set_result(None)
 
     def test_cancel(self):
         self.s3_request.finished_future = Future()
-        thread = delayFutureThread(self.s3_request.finished_future)
-        thread.start()
+        self.cancel_called = False
+        self.s3_request.cancel = self._cancel_function
         try:
             with self.transfer_manager:
                 future = self.transfer_manager.upload(
@@ -138,5 +143,4 @@ class TestCRTTransferManager(unittest.TestCase):
                 raise KeyboardInterrupt()
         except KeyboardInterrupt:
             pass
-        thread.join()
-        self.assertTrue(self.s3_request.cancel.called)
+        self.assertTrue(self.cancel_called)

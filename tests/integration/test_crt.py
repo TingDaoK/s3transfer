@@ -17,6 +17,7 @@ from tests.integration import BaseTransferManagerIntegTest
 from tests import assert_files_equal
 
 import s3transfer.crt as crt
+from awscrt.exceptions import AwsCrtError
 
 
 class TestCRTS3Transfers(BaseTransferManagerIntegTest):
@@ -241,15 +242,10 @@ class TestCRTS3Transfers(BaseTransferManagerIntegTest):
         except KeyboardInterrupt:
             pass
 
-        try:
+        with self.assertRaises(AwsCrtError) as cm:
             future.result()
-        except Exception as e:
-            self.assertTrue("AwsCrtError" in str(e))
-            self.assertEqual(e.name, "AWS_ERROR_S3_CANCELED")
-            self.assertTrue(self.object_not_exists('20mb.txt'))
-        else:
-            # Failed
-            self.assertTrue(False)
+            self.assertEqual(cm.name, 'AWS_ERROR_S3_CANCELED')
+        self.assertTrue(self.object_not_exists('20mb.txt'))
 
     def test_download_cancel(self):
         transfer = self._create_s3_transfer()
@@ -267,14 +263,9 @@ class TestCRTS3Transfers(BaseTransferManagerIntegTest):
         except KeyboardInterrupt:
             pass
 
-        try:
+        with self.assertRaises(AwsCrtError) as cm:
             future.result()
-        except Exception as e:
-            self.assertTrue("AwsCrtError" in str(e))
-            self.assertEqual(e.name, "AWS_ERROR_S3_CANCELED")
-        else:
-            # Failed
-            self.assertTrue(False)
+            self.assertEqual(cm.name, 'AWS_ERROR_S3_CANCELED')
 
         possible_matches = glob.glob('%s*' % download_path)
         self.assertEqual(possible_matches, [])
