@@ -170,7 +170,7 @@ class CRTTransferManager(object):
             coordinator.set_exception(e, True)
             on_done = self._s3_args_creator.get_crt_callback(
                 future, 'done', after_subscribers=on_done_after_calls)
-            on_done()
+            on_done(error=e)
         else:
             coordinator.set_s3_request(crt_s3_request)
         self._futures.append(future)

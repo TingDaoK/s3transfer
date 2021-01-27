@@ -24,16 +24,6 @@ class submitThread(threading.Thread):
         self._futures.append(self._transfer_manager.download(*self._callargs))
 
 
-class delayFutureThread(threading.Thread):
-    def __init__(self, future):
-        threading.Thread.__init__(self)
-        self._future = future
-
-    def run(self):
-        time.sleep(1)
-        self._future.set_result(None)
-
-
 class TestCRTTransferManager(unittest.TestCase):
     def setUp(self):
         self.max_request_processes = 2
