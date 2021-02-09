@@ -42,8 +42,6 @@ class CRTTransferManager(object):
     """
 
     def __init__(self, session, config=None, osutil=None, crt_s3_client=None):
-        self._crt_credential_provider = \
-            self._botocore_credential_provider_adaptor(session)
         if config is None:
             config = CRTTransferConfig()
         self._owns_crt_client = False
@@ -56,6 +54,8 @@ class CRTTransferManager(object):
         self._s3_args_creator = S3ClientArgsCreator(session, self._osutil)
         self._futures = []
         self._semaphore = threading.Semaphore(config.max_request_queue_size)
+        # A counter to create unique id's for each transfer submitted.
+        self._id_counter = 0
 
     def __enter__(self):
         return self
@@ -140,23 +140,20 @@ class CRTTransferManager(object):
         client_factory = CRTS3ClientFactory()
         return client_factory.create_client(
             region=session.get_config_variable("region"),
-            client_config=session.get_default_client_config(),
             transfer_config=transfer_config,
-            credential_provider=self._crt_credential_provider
+            credential_provider=self._botocore_credential_provider_adaptor(
+                session)
         )
 
     def _release_semaphore(self, **kwargs):
         self._semaphore.release()
 
     def _submit_transfer(self, request_type, call_args):
-        # TODO unique id may be needed for the future.
         on_done_after_calls = [self._release_semaphore]
-        coordinator = CRTTransferCoordinator()
+        coordinator = CRTTransferCoordinator(transfer_id=self._id_counter)
         future = CRTTransferFuture(CRTTransferMeta(
             call_args=call_args), coordinator)
 
-        # TODO get_make_request_args and on_queue can fail from botocore.
-        # Handle the error properly
         on_queued = self._s3_args_creator.get_crt_callback(future, 'queued')
         on_queued()
         crt_callargs = self._s3_args_creator.get_make_request_args(
@@ -174,6 +171,7 @@ class CRTTransferManager(object):
         else:
             coordinator.set_s3_request(crt_s3_request)
         self._futures.append(future)
+        self._id_counter += 1
         return future
 
 
@@ -241,7 +239,8 @@ class CRTTransferMeta(BaseTransferMeta):
 
 
 class CRTTransferCoordinator:
-    def __init__(self, s3_request=None):
+    def __init__(self, transfer_id=None, s3_request=None):
+        self.transfer_id = transfer_id
         self._s3_request = s3_request
         self._lock = threading.Lock()
         self._exception = None
@@ -312,9 +311,7 @@ class CRTTransferFuture(BaseTransferFuture):
 
 class CRTS3ClientFactory:
     def create_client(self, region, transfer_config=None,
-                      client_config=None,
                       credential_provider=None):
-        # TODO client config is not resolved correctly.
         event_loop_group = EventLoopGroup(
             transfer_config.max_request_processes)
         host_resolver = DefaultHostResolver(event_loop_group)
