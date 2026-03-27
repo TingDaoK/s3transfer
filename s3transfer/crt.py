@@ -13,11 +13,9 @@
 import logging
 import re
 import threading
-from collections import namedtuple
 from io import BytesIO
 
 import awscrt.http
-import awscrt.s3
 import botocore.awsrequest
 import botocore.session
 from awscrt.auth import (
@@ -33,24 +31,24 @@ from awscrt.io import (
     EventLoopGroup,
     TlsContextOptions,
 )
-from awscrt.s3 import S3Client, S3RequestTlsMode, S3RequestType
+from awscrt.s3 import (
+    S3Client,
+    S3FileIoOptions,
+    S3RequestTlsMode,
+    S3RequestType,
+    S3ResponseError,
+    get_recommended_throughput_target_gbps,
+)
 from botocore import UNSIGNED
 from botocore.compat import urlsplit
 from botocore.config import Config
 from botocore.exceptions import NoCredentialsError
-from botocore.utils import ArnParser, InvalidArnException
-
+from botocore.useragent import register_feature_id
+from botocore.utils import ArnParser, InvalidArnException, is_s3express_bucket
 from s3transfer.constants import FULL_OBJECT_CHECKSUM_ARGS, MB
 from s3transfer.exceptions import TransferNotDoneError
-from s3transfer.futures import BaseTransferFuture, BaseTransferMeta
-from s3transfer.manager import TransferManager
-from s3transfer.utils import (
-    CallArgs,
-    OSUtils,
-    create_nested_client,
-    get_callbacks,
-    is_s3express_bucket,
-)
+from s3transfer.futures import BaseTransferFuture, BaseTransferMeta, BoundedExecutor
+from s3transfer.utils import CallArgs, OSUtils, get_callbacks
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +88,7 @@ def create_s3_crt_client(
     part_size=8 * MB,
     use_ssl=True,
     verify=None,
+    fio_options=None,
 ):
     """
     :type region: str
@@ -133,7 +132,11 @@ def create_s3_crt_client(
         * path/to/cert/bundle.pem - A filename of the CA cert bundle to
             use. Specify this argument if you want to use a custom CA cert
             bundle instead of the default one on your system.
+
+    :type fio_options: Optional[dict]
+    :param fio_options: Kwargs to use to build an `awscrt.s3.S3FileIoOptions`.
     """
+
     event_loop_group = EventLoopGroup(num_threads)
     host_resolver = DefaultHostResolver(event_loop_group)
     bootstrap = ClientBootstrap(event_loop_group, host_resolver)
@@ -155,6 +158,9 @@ def create_s3_crt_client(
     target_gbps = _get_crt_throughput_target_gbps(
         provided_throughput_target_bytes=target_throughput
     )
+    crt_fio_options = None
+    if fio_options:
+        crt_fio_options = S3FileIoOptions(**fio_options)
     return S3Client(
         bootstrap=bootstrap,
         region=region,
@@ -164,12 +170,13 @@ def create_s3_crt_client(
         tls_connection_options=tls_connection_options,
         throughput_target_gbps=target_gbps,
         enable_s3express=True,
+        fio_options=crt_fio_options,
     )
 
 
 def _get_crt_throughput_target_gbps(provided_throughput_target_bytes=None):
     if provided_throughput_target_bytes is None:
-        target_gbps = awscrt.s3.get_recommended_throughput_target_gbps()
+        target_gbps = get_recommended_throughput_target_gbps()
         logger.debug(
             'Recommended CRT throughput target in gbps: %s', target_gbps
         )
@@ -185,27 +192,17 @@ def _get_crt_throughput_target_gbps(provided_throughput_target_bytes=None):
     return target_gbps
 
 
-def _has_minimum_crt_version(minimum_version):
-    crt_version_str = awscrt.__version__
-    try:
-        crt_version_ints = map(int, crt_version_str.split("."))
-        crt_version_tuple = tuple(crt_version_ints)
-    except (TypeError, ValueError):
-        return False
-    return crt_version_tuple >= minimum_version
-
-
 class CRTTransferManager:
-    ALLOWED_DOWNLOAD_ARGS = TransferManager.ALLOWED_DOWNLOAD_ARGS
-    ALLOWED_UPLOAD_ARGS = TransferManager.ALLOWED_UPLOAD_ARGS
-    ALLOWED_DELETE_ARGS = TransferManager.ALLOWED_DELETE_ARGS
-
-    VALIDATE_SUPPORTED_BUCKET_VALUES = True
-
-    _UNSUPPORTED_BUCKET_PATTERNS = TransferManager._UNSUPPORTED_BUCKET_PATTERNS
-
     def __init__(
-        self, crt_s3_client, crt_request_serializer, osutil=None, config=None
+        self,
+        crt_s3_client,
+        crt_request_serializer,
+        osutil=None,
+        max_request_concurrency=128,
+        max_submission_concurrency=100,
+        max_request_queue_size=1000,
+        max_submission_queue_size=1000,
+        executor_cls=None,
     ):
         """A transfer manager interface for Amazon S3 on CRT s3 client.
 
@@ -221,23 +218,47 @@ class CRTTransferManager:
         :param osutil: OSUtils object to use for os-related behavior when
             using with transfer manager.
 
-        :type config: s3transfer.manager.TransferConfig
-        :param config: The transfer configuration to be used when
-            making CRT S3 client requests.
+        :type max_request_concurrency: int
+        :param max_request_concurrency: The maximum number of S3 API requests
+            that can happen at a time. Default is 128.
+
+        :type max_submission_concurrency: int
+        :param max_submission_concurrency: The maximum number of threads
+            processing calls to submit transfer requests. Default is 5.
+
+        :type max_request_queue_size: int
+        :param max_request_queue_size: The maximum amount of S3 API requests
+            that can be queued at a time. Default is 1000.
+
+        :type max_submission_queue_size: int
+        :param max_submission_queue_size: The maximum amount of transfer
+            submission requests that can be queued at a time. Default is 1000.
+
+        :type executor_cls: s3transfer.futures.BaseExecutor
+        :param executor_cls: The class of executor to use with the transfer
+            manager. By default, concurrent.futures.ThreadPoolExecutor is used.
         """
         if osutil is None:
             self._osutil = OSUtils()
         self._crt_s3_client = crt_s3_client
         self._s3_args_creator = S3ClientArgsCreator(
-            crt_request_serializer,
-            self._osutil,
-            config,
+            crt_request_serializer, self._osutil
         )
         self._crt_exception_translator = (
             crt_request_serializer.translate_crt_exception
         )
         self._future_coordinators = []
-        self._semaphore = threading.Semaphore(128)  # not configurable
+
+        # The executor responsible for submitting transfer requests in parallel
+        self._submission_executor = BoundedExecutor(
+            max_size=max_submission_queue_size,
+            max_num_threads=max_submission_concurrency,
+            executor_cls=executor_cls,
+        )
+
+        # Semaphore for limiting concurrent requests
+        self._semaphore = threading.Semaphore(max_request_concurrency)
+
         # A counter to create unique id's for each transfer submitted.
         self._id_counter = 0
 
@@ -257,8 +278,6 @@ class CRTTransferManager:
             extra_args = {}
         if subscribers is None:
             subscribers = {}
-        self._validate_all_known_args(extra_args, self.ALLOWED_DOWNLOAD_ARGS)
-        self._validate_if_bucket_supported(bucket)
         callargs = CallArgs(
             bucket=bucket,
             key=key,
@@ -273,8 +292,6 @@ class CRTTransferManager:
             extra_args = {}
         if subscribers is None:
             subscribers = {}
-        self._validate_all_known_args(extra_args, self.ALLOWED_UPLOAD_ARGS)
-        self._validate_if_bucket_supported(bucket)
         self._validate_checksum_algorithm_supported(extra_args)
         callargs = CallArgs(
             bucket=bucket,
@@ -290,8 +307,6 @@ class CRTTransferManager:
             extra_args = {}
         if subscribers is None:
             subscribers = {}
-        self._validate_all_known_args(extra_args, self.ALLOWED_DELETE_ARGS)
-        self._validate_if_bucket_supported(bucket)
         callargs = CallArgs(
             bucket=bucket,
             key=key,
@@ -302,27 +317,6 @@ class CRTTransferManager:
 
     def shutdown(self, cancel=False):
         self._shutdown(cancel)
-
-    def _validate_if_bucket_supported(self, bucket):
-        # s3 high level operations don't support some resources
-        # (eg. S3 Object Lambda) only direct API calls are available
-        # for such resources
-        if self.VALIDATE_SUPPORTED_BUCKET_VALUES:
-            for resource, pattern in self._UNSUPPORTED_BUCKET_PATTERNS.items():
-                match = pattern.match(bucket)
-                if match:
-                    raise ValueError(
-                        f'TransferManager methods do not support {resource} '
-                        'resource. Use direct client calls instead.'
-                    )
-
-    def _validate_all_known_args(self, actual, allowed):
-        for kwarg in actual:
-            if kwarg not in allowed:
-                raise ValueError(
-                    f"Invalid extra_args key '{kwarg}', "
-                    f"must be one of: {', '.join(allowed)}"
-                )
 
     def _validate_checksum_algorithm_supported(self, extra_args):
         checksum_algorithm = extra_args.get('ChecksumAlgorithm')
@@ -360,11 +354,14 @@ class CRTTransferManager:
             pass
         finally:
             self._wait_transfers_done()
+            # Shutdown the submission executor
+            self._submission_executor.shutdown()
 
     def _release_semaphore(self, **kwargs):
         self._semaphore.release()
 
     def _submit_transfer(self, request_type, call_args):
+        register_feature_id('S3_TRANSFER')
         on_done_after_calls = [self._release_semaphore]
         coordinator = CRTTransferCoordinator(
             transfer_id=self._id_counter,
@@ -378,29 +375,19 @@ class CRTTransferManager:
         afterdone = AfterDoneHandler(coordinator)
         on_done_after_calls.append(afterdone)
 
-        try:
-            self._semaphore.acquire()
-            on_queued = self._s3_args_creator.get_crt_callback(
-                future, 'queued'
-            )
-            on_queued()
-            crt_callargs = self._s3_args_creator.get_make_request_args(
-                request_type,
-                call_args,
-                coordinator,
-                future,
-                on_done_after_calls,
-            )
-            crt_s3_request = self._crt_s3_client.make_request(**crt_callargs)
-        except Exception as e:
-            coordinator.set_exception(e, True)
-            on_done = self._s3_args_creator.get_crt_callback(
-                future, 'done', after_subscribers=on_done_after_calls
-            )
-            on_done(error=e)
-        else:
-            coordinator.set_s3_request(crt_s3_request)
+        # Track the coordinator
         self._future_coordinators.append(coordinator)
+
+        # Submit the actual transfer work to the submission executor for parallel processing
+        submission_task = CRTTransferSubmissionTask(
+            transfer_manager=self,
+            request_type=request_type,
+            call_args=call_args,
+            coordinator=coordinator,
+            future=future,
+            on_done_after_calls=on_done_after_calls,
+        )
+        self._submission_executor.submit(submission_task)
 
         self._id_counter += 1
         return future
@@ -465,6 +452,61 @@ class CRTTransferFuture(BaseTransferFuture):
         self._coordinator.set_exception(exception, override=True)
 
 
+class CRTTransferSubmissionTask:
+    """Task for submitting a CRT transfer request to the CRT S3 client.
+
+    This task is executed by the submission executor to allow parallel
+    submission of transfer requests.
+    """
+
+    def __init__(
+        self,
+        transfer_manager,
+        request_type,
+        call_args,
+        coordinator,
+        future,
+        on_done_after_calls,
+    ):
+        self._transfer_manager = transfer_manager
+        self._request_type = request_type
+        self._call_args = call_args
+        self._coordinator = coordinator
+        self._future = future
+        self._on_done_after_calls = on_done_after_calls
+
+    @property
+    def transfer_id(self):
+        """The transfer ID for this submission task."""
+        return self._coordinator.transfer_id
+
+    def __call__(self, context=None):
+        """Execute the submission task."""
+        try:
+            self._transfer_manager._semaphore.acquire()
+            on_queued = self._transfer_manager._s3_args_creator.get_crt_callback(
+                self._future, 'queued'
+            )
+            on_queued()
+            crt_callargs = self._transfer_manager._s3_args_creator.get_make_request_args(
+                self._request_type,
+                self._call_args,
+                self._coordinator,
+                self._future,
+                self._on_done_after_calls,
+            )
+            crt_s3_request = self._transfer_manager._crt_s3_client.make_request(
+                **crt_callargs
+            )
+            self._coordinator.set_s3_request(crt_s3_request)
+        except Exception as e:
+            self._coordinator.set_exception(e, True)
+            on_done = self._transfer_manager._s3_args_creator.get_crt_callback(
+                self._future, 'done', after_subscribers=self._on_done_after_calls
+            )
+            on_done(error=e)
+
+
 class BaseCRTRequestSerializer:
     def serialize_http_request(self, transfer_type, future):
         """Serialize CRT HTTP requests.
@@ -501,7 +543,7 @@ class BotocoreCRTRequestSerializer(BaseCRTRequestSerializer):
         if client_kwargs is None:
             client_kwargs = {}
         self._resolve_client_config(session, client_kwargs)
-        self._client = create_nested_client(session, **client_kwargs)
+        self._client = session.create_client(**client_kwargs)
         self._client.meta.events.register(
             'request-created.s3.*', self._capture_http_request
         )
@@ -610,7 +652,7 @@ class BotocoreCRTRequestSerializer(BaseCRTRequestSerializer):
         return crt_request
 
     def translate_crt_exception(self, exception):
-        if isinstance(exception, awscrt.s3.S3ResponseError):
+        if isinstance(exception, S3ResponseError):
             return self._translate_crt_s3_response_error(exception)
         else:
             return None
@@ -750,72 +792,10 @@ class CRTTransferCoordinator:
         self._crt_future = self._s3_request.finished_future
 
 
-CRTConfigParameter = namedtuple('CRTConfigParameter', ['name', 'min_version'])
-
-
 class S3ClientArgsCreator:
-    _CRT_ARG_TO_CONFIG_PARAM = {
-        'max_active_connections_override': CRTConfigParameter(
-            'max_request_concurrency', (0, 29, 0)
-        ),
-    }
-
-    def __init__(self, crt_request_serializer, os_utils, config=None):
+    def __init__(self, crt_request_serializer, os_utils):
         self._request_serializer = crt_request_serializer
         self._os_utils = os_utils
-        self._config = config
-
-    def _get_crt_transfer_config_options(self, request_type):
-        crt_config = {
-            'part_size': self._config.multipart_chunksize,
-            'max_active_connections_override': self._config.max_request_concurrency,
-        }
-
-        if (
-            self._config.get_deep_attr('multipart_chunksize')
-            is self._config.UNSET_DEFAULT
-        ):
-            # Let CRT dynamically calculate part size.
-            crt_config['part_size'] = None
-        if (
-            self._config.get_deep_attr('max_request_concurrency')
-            is self._config.UNSET_DEFAULT
-        ):
-            crt_config['max_active_connections_override'] = None
-
-        if hasattr(self, f'_get_crt_options_{request_type}'):
-            crt_config.update(
-                getattr(self, f'_get_crt_options_{request_type}')()
-            )
-        self._remove_param_if_not_min_crt_version(crt_config)
-        return crt_config
-
-    def _get_crt_options_put_object(self):
-        return {'multipart_upload_threshold': self._config.multipart_threshold}
-
-    def _remove_param_if_not_min_crt_version(self, crt_config):
-        to_remove = []
-        for request_arg in crt_config:
-            if request_arg not in self._CRT_ARG_TO_CONFIG_PARAM:
-                continue
-            param = self._CRT_ARG_TO_CONFIG_PARAM[request_arg]
-            if _has_minimum_crt_version(param.min_version):
-                continue
-            # Only log the warning if user attempted to explicitly
-            # use the transfer config parameter.
-            if (
-                self._config.get_deep_attr(param.name)
-                is not self._config.UNSET_DEFAULT
-            ):
-                min_ver_str = '.'.join(str(i) for i in param.min_version)
-                logger.warning(
-                    f'Transfer config parameter {param.name} '
-                    f'requires minimum CRT version: {min_ver_str}. '
-                    f'{param.name} will not be used in the request.'
-                )
-            to_remove.append(request_arg)
-        for request_arg in to_remove:
-            del crt_config[request_arg]
 
     def get_make_request_args(
         self, request_type, call_args, coordinator, future, on_done_after_calls
@@ -882,7 +862,7 @@ class S3ClientArgsCreator:
             for checksum_arg in FULL_OBJECT_CHECKSUM_ARGS
         ):
             checksum_algorithm = call_args.extra_args.pop(
-                'ChecksumAlgorithm', 'CRC32'
+                'ChecksumAlgorithm', 'CRC64NVME'
             ).upper()
             checksum_config = awscrt.s3.S3ChecksumConfig(
                 algorithm=awscrt.s3.S3ChecksumAlgorithm[checksum_algorithm],
@@ -904,10 +884,6 @@ class S3ClientArgsCreator:
         )
         make_request_args['send_filepath'] = send_filepath
         make_request_args['checksum_config'] = checksum_config
-        if self._config is not None:
-            make_request_args.update(
-                self._get_crt_transfer_config_options(request_type)
-            )
         return make_request_args
 
     def _get_make_request_args_get_object(
@@ -944,10 +920,6 @@ class S3ClientArgsCreator:
         make_request_args['recv_filepath'] = recv_filepath
         make_request_args['on_body'] = on_body
         make_request_args['checksum_config'] = checksum_config
-        if self._config is not None:
-            make_request_args.update(
-                self._get_crt_transfer_config_options(request_type)
-            )
         return make_request_args
 
     def _default_get_make_request_args(
